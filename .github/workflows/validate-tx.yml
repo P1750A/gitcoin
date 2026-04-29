@@ -123,17 +123,28 @@ jobs:
           import json, random, math, subprocess, os, sys
           from datetime import datetime, timezone, timedelta
 
+          # Load pubkeys.json as validator pool
+          pubkeys_path = 'validators/pubkeys.json'
+          pubkeys = {}
+          if os.path.exists(pubkeys_path):
+              with open(pubkeys_path) as f:
+                  pubkeys = json.load(f)
+
+          # Load registry for scoring metadata (optional)
+          registry_map = {}
           registry_path = 'validators/registry.json'
-          with open(registry_path) as f:
-              registry = json.load(f)
+          if os.path.exists(registry_path):
+              with open(registry_path) as f:
+                  reg = json.load(f)
+              for v in reg.get('validators', []):
+                  registry_map[v['username']] = v
 
           now = datetime.now(timezone.utc)
           active = []
-          for v in registry.get('validators', []):
-              if v.get('status') != 'active':
-                  continue
-              score = v.get('score', 0)
-              last_active_str = v.get('last_active', '')
+          for username in pubkeys:
+              reg_entry = registry_map.get(username, {})
+              score = reg_entry.get('score', 100)
+              last_active_str = reg_entry.get('last_active', '')
               if last_active_str:
                   try:
                       last_active = datetime.fromisoformat(last_active_str.replace('Z', '+00:00'))
@@ -142,10 +153,10 @@ jobs:
                   except ValueError:
                       pass
               if score >= 0:
-                  active.append(v)
+                  active.append({'username': username})
 
           if not active:
-              print("ERROR: No active validators found", file=sys.stderr)
+              print("ERROR: No validators found in pubkeys.json", file=sys.stderr)
               sys.exit(1)
 
           rng = random.Random(int(os.environ['RUN_ID']))

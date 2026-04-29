@@ -69,26 +69,13 @@ jobs:
                   '-f', f'description={description[:140]}'
               ], env=os.environ)
 
-          # Load validator registry and calculate effective scores
-          with open('validators/registry.json') as f:
-              registry = json.load(f)
-
-          now = datetime.now(timezone.utc)
-          active_validators = set()
-          for v in registry.get('validators', []):
-              if v.get('status') != 'active':
-                  continue
-              score = v.get('score', 0)
-              last_active_str = v.get('last_active', '')
-              if last_active_str:
-                  try:
-                      last_active = datetime.fromisoformat(last_active_str.replace('Z', '+00:00'))
-                      weeks_inactive = max(0, (now - last_active).days // 7)
-                      score -= weeks_inactive * 10
-                  except ValueError:
-                      pass
-              if score >= 0:
-                  active_validators.add(v['username'])
+          # Anyone in pubkeys.json is a valid validator
+          valid_validators = set()
+          pubkeys_path = 'validators/pubkeys.json'
+          if os.path.exists(pubkeys_path):
+              with open(pubkeys_path) as f:
+                  pubkeys = json.load(f)
+              valid_validators = set(pubkeys.keys())
 
           # Get all PR comments
           r = subprocess.run(
@@ -122,7 +109,7 @@ jobs:
           for c in comments:
               user = c.get('user', {}).get('login', '')
               body = c.get('body', '').strip()
-              if body == '/approve' and user in selected_validators and user in active_validators:
+              if body == '/approve' and user in selected_validators and user in valid_validators:
                   approvals.add(user)
 
           approval_count = len(approvals)
