@@ -1,0 +1,15 @@
+{
+  "block_height": 0,
+  "block_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "timestamp": "2026-04-29T00:00:00Z",
+  "initial_supply": 4294967295,
+  "unit": "GTC",
+  "distributions": [
+    {
+      "owner": "volta2030",
+      "amount": 4294967295,
+      "unit": "GTC",
+      "txid": "2605529c87b621197bd181794c7aa7dc7aed04ef5c047a27982cc7c86958a5fa"
+    }
+  ]
+}

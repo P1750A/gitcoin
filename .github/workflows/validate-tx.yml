@@ -1,0 +1,103 @@
+name: Validate Transaction
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  statuses: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Python dependencies
+        run: pip install cryptography --quiet
+
+      - name: Fetch PR changed files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            > /tmp/pr_files.json
+
+      - name: Fetch PR head file contents
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'EOF'
+          import json, subprocess, base64, os
+
+          with open('/tmp/pr_files.json') as f:
+              files = json.load(f)
+
+          head_sha = "${{ github.event.pull_request.head.sha }}"
+          repo = "${{ github.repository }}"
+          fetched = {}
+
+          for fi in files:
+              # Fetch added utxo files and modified validators/pubkeys.json
+              should_fetch = (
+                  (fi['status'] == 'added' and fi['filename'].startswith('utxo/')) or
+                  (fi['status'] == 'modified' and fi['filename'] == 'validators/pubkeys.json')
+              )
+              if not should_fetch:
+                  continue
+              r = subprocess.run(
+                  ['gh', 'api', f"repos/{repo}/contents/{fi['filename']}?ref={head_sha}"],
+                  capture_output=True, text=True, env=os.environ
+              )
+              if r.returncode == 0:
+                  data = json.loads(r.stdout)
+                  content = base64.b64decode(data['content'].replace('\n', '')).decode()
+                  fetched[fi['filename']] = content
+
+          with open('/tmp/pr_head_content.json', 'w') as f:
+              json.dump(fetched, f)
+          EOF
+
+      - name: Run transaction validation
+        id: validate
+        continue-on-error: true
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          python3 .github/scripts/validate_tx.py \
+            /tmp/pr_files.json \
+            /tmp/pr_head_content.json \
+            2>&1 | tee /tmp/result.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Post success status
+        if: steps.validate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state=success \
+            -f context="validate-tx/validate" \
+            -f description="Transaction is valid"
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "tx-valid" 2>/dev/null || true
+          gh pr edit ${{ github.event.pull_request.number }} --remove-label "tx-invalid" 2>/dev/null || true
+
+      - name: Post failure status
+        if: steps.validate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REASON=$(head -1 /tmp/result.txt | cut -c1-140)
+          gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state=failure \
+            -f context="validate-tx/validate" \
+            -f "description=${REASON}"
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "tx-invalid" 2>/dev/null || true
+          gh pr edit ${{ github.event.pull_request.number }} --remove-label "tx-valid" 2>/dev/null || true
+          BODY=$(printf '❌ **Transaction validation failed:**\n\n```\n%s\n```' "$(cat /tmp/result.txt)")
+          gh pr comment ${{ github.event.pull_request.number }} --body "${BODY}"

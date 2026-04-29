@@ -1,0 +1,12 @@
+{
+  "validators": [
+    {
+      "username": "volta2030",
+      "score": 840,
+      "last_active": "2026-04-29T00:00:00Z",
+      "status": "active"
+    }
+  ],
+  "total_validators": 1,
+  "last_updated_block": "0000000000000000000000000000000000000000000000000000000000000000"
+}

@@ -1,0 +1,86 @@
+name: Expire Stale Transactions
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  expire:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close transactions that exceeded the 48-hour voting window
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'EOF'
+          import json, subprocess, os, sys
+          from datetime import datetime, timezone, timedelta
+
+          repo = "${{ github.repository }}"
+          now = datetime.now(timezone.utc)
+          timeout = timedelta(hours=48)
+
+          r = subprocess.run(
+              ['gh', 'api', f'repos/{repo}/pulls?state=open&per_page=100'],
+              capture_output=True, text=True, env=os.environ
+          )
+          if r.returncode != 0:
+              print("ERROR: Failed to fetch open PRs", file=sys.stderr)
+              sys.exit(1)
+
+          prs = json.loads(r.stdout)
+          expired_count = 0
+
+          for pr in prs:
+              labels = [l['name'] for l in pr.get('labels', [])]
+              if 'tx-valid' not in labels:
+                  continue
+              if 'tx-expired' in labels:
+                  continue
+
+              created_at = datetime.fromisoformat(pr['created_at'].replace('Z', '+00:00'))
+              if (now - created_at) <= timeout:
+                  continue
+
+              # Check if consensus was already reached
+              head_sha = pr['head']['sha']
+              r2 = subprocess.run(
+                  ['gh', 'api', f'repos/{repo}/commits/{head_sha}/statuses'],
+                  capture_output=True, text=True, env=os.environ
+              )
+              statuses = json.loads(r2.stdout) if r2.returncode == 0 else []
+
+              # Find the latest consensus-check status
+              for s in statuses:
+                  if s.get('context') == 'consensus-check/passed' and s.get('state') == 'success':
+                      break
+              else:
+                  # No consensus — expire this PR
+                  pr_number = str(pr['number'])
+                  comment = (
+                      "⏰ **Transaction expired.**\n\n"
+                      "This transaction did not reach validator consensus within 48 hours. "
+                      "The PR has been closed. You may resubmit it as a new PR if needed."
+                  )
+                  subprocess.run(
+                      ['gh', 'pr', 'comment', pr_number, '--body', comment],
+                      env=os.environ
+                  )
+                  subprocess.run(
+                      ['gh', 'pr', 'edit', pr_number, '--add-label', 'tx-expired'],
+                      env=os.environ
+                  )
+                  subprocess.run(
+                      ['gh', 'pr', 'close', pr_number],
+                      env=os.environ
+                  )
+                  expired_count += 1
+                  print(f"Expired PR #{pr_number}: {pr['title']}")
+
+          print(f"Done. Expired {expired_count} transaction(s).")
+          EOF

@@ -439,10 +439,10 @@ File: `genesis/genesis.json`
   "block_height": 0,
   "block_hash": "0000000000000000000000000000000000000000000000000000000000000000",
   "timestamp": "2026-04-29T00:00:00Z",
-  "initial_supply": 1000000,
+  "initial_supply": 4294967295,
   "unit": "GTC",
   "distributions": [
-    { "owner": "repo_owner_username", "amount": 1000000, "unit": "GTC", "txid": "genesis_txid_0" }
+    { "owner": "repo_owner_username", "amount": 4294967295, "unit": "GTC", "txid": "genesis_txid_0" }
   ]
 }
 ```

@@ -1,0 +1,136 @@
+name: Consensus Check
+
+on:
+  issue_comment:
+    types: [created, deleted]
+
+permissions:
+  statuses: write
+  pull-requests: read
+  issues: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Only run for comments on PRs
+    if: github.event.issue.pull_request != null
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Count validator approvals and update status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          python3 - << 'EOF'
+          import json, subprocess, os, sys, re, math
+          from datetime import datetime, timezone
+
+          repo = "${{ github.repository }}"
+          pr_number = os.environ['PR_NUMBER']
+          comment_body = os.environ.get('COMMENT_BODY', '').strip()
+          event_action = os.environ.get('EVENT_ACTION', '')
+
+          # On creation, only proceed if comment is /approve
+          if event_action == 'created' and comment_body != '/approve':
+              print("Not an /approve comment, skipping")
+              sys.exit(0)
+
+          # Verify PR is still open
+          r = subprocess.run(
+              ['gh', 'api', f'repos/{repo}/issues/{pr_number}'],
+              capture_output=True, text=True, env=os.environ
+          )
+          if r.returncode != 0:
+              sys.exit(1)
+          if json.loads(r.stdout).get('state') != 'open':
+              print("PR is closed, skipping")
+              sys.exit(0)
+
+          # Get PR head SHA
+          r = subprocess.run(
+              ['gh', 'api', f'repos/{repo}/pulls/{pr_number}'],
+              capture_output=True, text=True, env=os.environ
+          )
+          if r.returncode != 0:
+              sys.exit(1)
+          head_sha = json.loads(r.stdout)['head']['sha']
+
+          def post_status(state, description):
+              subprocess.run([
+                  'gh', 'api', f'repos/{repo}/statuses/{head_sha}',
+                  '-f', f'state={state}',
+                  '-f', 'context=consensus-check/passed',
+                  '-f', f'description={description[:140]}'
+              ], env=os.environ)
+
+          # Load validator registry and calculate effective scores
+          with open('validators/registry.json') as f:
+              registry = json.load(f)
+
+          now = datetime.now(timezone.utc)
+          active_validators = set()
+          for v in registry.get('validators', []):
+              if v.get('status') != 'active':
+                  continue
+              score = v.get('score', 0)
+              last_active_str = v.get('last_active', '')
+              if last_active_str:
+                  try:
+                      last_active = datetime.fromisoformat(last_active_str.replace('Z', '+00:00'))
+                      weeks_inactive = max(0, (now - last_active).days // 7)
+                      score -= weeks_inactive * 10
+                  except ValueError:
+                      pass
+              if score >= 0:
+                  active_validators.add(v['username'])
+
+          # Get all PR comments
+          r = subprocess.run(
+              ['gh', 'api', f'repos/{repo}/issues/{pr_number}/comments', '--paginate'],
+              capture_output=True, text=True, env=os.environ
+          )
+          if r.returncode != 0:
+              post_status('error', 'Failed to fetch PR comments')
+              sys.exit(1)
+          comments = json.loads(r.stdout)
+
+          # Find assign-validators comment to get selected list and required count
+          selected_validators = None
+          required = None
+          for c in comments:
+              body = c.get('body', '')
+              m = re.search(r'<!-- GITCOIN_VALIDATORS:([\w,\-]+) -->', body)
+              r_match = re.search(r'<!-- GITCOIN_REQUIRED:(\d+) -->', body)
+              if m and r_match:
+                  selected_validators = set(m.group(1).split(','))
+                  required = int(r_match.group(1))
+                  break
+
+          if selected_validators is None or required is None:
+              post_status('pending', 'Waiting for validator assignment')
+              print("No validator assignment comment found yet")
+              sys.exit(0)
+
+          # Count distinct /approve comments from selected active validators
+          approvals = set()
+          for c in comments:
+              user = c.get('user', {}).get('login', '')
+              body = c.get('body', '').strip()
+              if body == '/approve' and user in selected_validators and user in active_validators:
+                  approvals.add(user)
+
+          approval_count = len(approvals)
+          total_selected = len(selected_validators)
+          print(f"Approvals: {approval_count}/{required} required (selected: {sorted(approvals)})")
+
+          if approval_count >= required:
+              post_status('success', f'Consensus reached: {approval_count}/{total_selected} validator approvals')
+          else:
+              post_status('pending', f'Waiting for consensus: {approval_count}/{required} approvals needed')
+          EOF

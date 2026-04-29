@@ -1,0 +1,95 @@
+name: Assign Validators
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'tx-valid'
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Select validators and post vote request comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - << 'EOF'
+          import json, random, math, subprocess, os, sys
+          from datetime import datetime, timezone, timedelta
+
+          registry_path = 'validators/registry.json'
+          if not os.path.exists(registry_path):
+              print("ERROR: validators/registry.json not found", file=sys.stderr)
+              sys.exit(1)
+
+          with open(registry_path) as f:
+              registry = json.load(f)
+
+          now = datetime.now(timezone.utc)
+
+          # Calculate effective scores with decay (no write needed)
+          active = []
+          for v in registry.get('validators', []):
+              if v.get('status') != 'active':
+                  continue
+              score = v.get('score', 0)
+              last_active_str = v.get('last_active', '')
+              if last_active_str:
+                  try:
+                      last_active = datetime.fromisoformat(last_active_str.replace('Z', '+00:00'))
+                      weeks_inactive = max(0, (now - last_active).days // 7)
+                      score -= weeks_inactive * 10
+                  except ValueError:
+                      pass
+              if score >= 0:
+                  active.append(v)
+
+          if not active:
+              print("ERROR: No active validators found", file=sys.stderr)
+              sys.exit(1)
+
+          # Deterministic random selection seeded by run_id
+          rng = random.Random(int(os.environ['RUN_ID']))
+          selected_count = min(7, len(active))
+          selected = rng.sample(active, selected_count)
+          required = math.ceil(selected_count * 2 / 3)
+          usernames = [v['username'] for v in selected]
+          mentions = ' '.join(f"@{u}" for u in usernames)
+          deadline = (now + timedelta(hours=48)).strftime('%Y-%m-%d %H:%M UTC')
+
+          comment = (
+              f"## 🔐 Validator Vote Requested\n\n"
+              f"{mentions}\n\n"
+              f"You have been selected to validate this transaction. "
+              f"To cast your vote, post the following comment on this PR:\n\n"
+              f"```\n/approve\n```\n\n"
+              f"**Consensus required**: {required} of {selected_count} selected validators\n"
+              f"**Deadline**: {deadline}\n\n"
+              f"If {required} approvals are not received by the deadline, "
+              f"this transaction will be automatically expired.\n\n"
+              f"---\n"
+              f"<!-- GITCOIN_VALIDATORS:{','.join(usernames)} -->\n"
+              f"<!-- GITCOIN_REQUIRED:{required} -->"
+          )
+
+          r = subprocess.run(
+              ['gh', 'pr', 'comment', os.environ['PR_NUMBER'], '--body', comment],
+              capture_output=True, text=True, env=os.environ
+          )
+          if r.returncode != 0:
+              print(f"ERROR: Failed to post comment: {r.stderr}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Selected {selected_count} validators, {required} approvals required")
+          print(f"Validators: {', '.join(usernames)}")
+          EOF

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+GitCoin Transaction Builder
+
+Builds and signs a GTC transfer transaction.
+Outputs the PR body and the exact file operations needed.
+
+Usage:
+  pip install cryptography
+  python3 create_transaction.py
+
+You will be prompted for:
+  - Your GitHub username
+  - Your private key (base64url)
+  - Recipient GitHub username
+  - Amount to send (GTC)
+  - UTXO txids to spend (comma-separated)
+  - MEMO (optional)
+
+The script reads input UTXO files from the local utxo/ directory
+(run this from the root of your forked repo after a git pull).
+"""
+
+import base64
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+except ImportError:
+    print("ERROR: Please install the cryptography library:")
+    print("  pip install cryptography")
+    sys.exit(1)
+
+
+def b64url_decode(s: str) -> bytes:
+    s = s.strip()
+    padding = 4 - len(s) % 4
+    if padding != 4:
+        s += '=' * padding
+    return base64.urlsafe_b64decode(s)
+
+
+def make_txid(owner: str, amount: int, block_hash: str) -> str:
+    data = f"{owner}{amount}{block_hash}"
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def canonical_message(tx: dict) -> str:
+    input_txids = sorted(t.strip() for t in tx['INPUT_TXIDS'].split(',') if t.strip())
+    lines = [
+        f"TX_VERSION:{tx['TX_VERSION']}",
+        f"FROM:{tx['FROM']}",
+        f"TO:{tx['TO']}",
+        f"AMOUNT:{tx['AMOUNT']}",
+        f"INPUT_TXIDS:{','.join(input_txids)}",
+        f"OUTPUT_TO_TXID:{tx['OUTPUT_TO_TXID']}",
+    ]
+    if tx.get('OUTPUT_CHANGE_TXID'):
+        lines.append(f"OUTPUT_CHANGE_TXID:{tx['OUTPUT_CHANGE_TXID']}")
+    if tx.get('MEMO'):
+        lines.append(f"MEMO:{tx['MEMO']}")
+    return '\n'.join(lines)
+
+
+def main():
+    print("=" * 60)
+    print("GitCoin Transaction Builder")
+    print("=" * 60)
+    print()
+
+    from_user = input("Your GitHub username: ").strip()
+    private_key_b64 = input("Your private key (base64url): ").strip()
+    to_user = input("Recipient GitHub username: ").strip()
+    amount_str = input("Amount to send (GTC): ").strip()
+    input_txids_str = input("UTXO txids to spend (comma-separated): ").strip()
+    memo = input("Memo (optional, press Enter to skip): ").strip()
+
+    try:
+        amount = int(amount_str)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        print("ERROR: Amount must be a positive integer")
+        sys.exit(1)
+
+    input_txids = [t.strip() for t in input_txids_str.split(',') if t.strip()]
+    if not input_txids:
+        print("ERROR: Must provide at least one input UTXO txid")
+        sys.exit(1)
+
+    # Load private key
+    try:
+        private_bytes = b64url_decode(private_key_b64)
+        private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    except Exception as e:
+        print(f"ERROR: Invalid private key: {e}")
+        sys.exit(1)
+
+    # Read input UTXOs from local utxo/ directory
+    input_total = 0
+    latest_block_hash = '0' * 64
+    for txid in input_txids:
+        utxo_path = Path(f"utxo/{txid}.json")
+        if not utxo_path.exists():
+            print(f"ERROR: UTXO file not found: utxo/{txid}.json")
+            print("Make sure you have pulled the latest main branch.")
+            sys.exit(1)
+        utxo = json.loads(utxo_path.read_text())
+        if utxo.get('owner') != from_user:
+            print(f"ERROR: UTXO {txid} is owned by '{utxo.get('owner')}', not '{from_user}'")
+            sys.exit(1)
+        input_total += int(utxo.get('amount', 0))
+        latest_block_hash = utxo.get('created_at_block', latest_block_hash)
+
+    if input_total < amount:
+        print(f"ERROR: Insufficient balance. Inputs total {input_total} GTC, need {amount} GTC.")
+        sys.exit(1)
+
+    change_amount = input_total - amount
+
+    # Compute output txids
+    # Use a block hash placeholder — the actual created_at_block will be the merge commit
+    # Use a deterministic hash based on the transaction content for the placeholder
+    tx_seed = f"{from_user}{to_user}{amount}{','.join(sorted(input_txids))}"
+    tx_nonce = hashlib.sha256(tx_seed.encode()).hexdigest()
+
+    output_to_txid = hashlib.sha256(f"{to_user}{amount}{tx_nonce}".encode()).hexdigest()
+    output_change_txid = None
+    if change_amount > 0:
+        output_change_txid = hashlib.sha256(f"{from_user}{change_amount}{tx_nonce}change".encode()).hexdigest()
+
+    tx = {
+        'TX_VERSION': '1',
+        'FROM': from_user,
+        'TO': to_user,
+        'AMOUNT': str(amount),
+        'INPUT_TXIDS': ','.join(sorted(input_txids)),
+        'OUTPUT_TO_TXID': output_to_txid,
+    }
+    if output_change_txid:
+        tx['OUTPUT_CHANGE_TXID'] = output_change_txid
+    if memo:
+        tx['MEMO'] = memo
+
+    # Sign the canonical message
+    msg = canonical_message(tx)
+    signature_bytes = private_key.sign(msg.encode('utf-8'))
+    signature_b64 = base64.urlsafe_b64encode(signature_bytes).decode().rstrip('=')
+    tx['SIGNATURE'] = signature_b64
+
+    # Build output UTXO JSON files
+    # Note: created_at_block is set to the nonce placeholder; the real block hash
+    # will differ after merge. The validator checks amounts/owners, not the block hash.
+    output_to_utxo = {
+        "txid": output_to_txid,
+        "owner": to_user,
+        "amount": amount,
+        "unit": "GTC",
+        "created_at_block": tx_nonce,
+        "created_at_height": 0
+    }
+    output_change_utxo = None
+    if output_change_txid:
+        output_change_utxo = {
+            "txid": output_change_txid,
+            "owner": from_user,
+            "amount": change_amount,
+            "unit": "GTC",
+            "created_at_block": tx_nonce,
+            "created_at_height": 0
+        }
+
+    # Print the PR body
+    print()
+    print("=" * 60)
+    print("STEP 1 — Copy this as your PR body:")
+    print("=" * 60)
+    pr_body_lines = [
+        f"TX_VERSION: {tx['TX_VERSION']}",
+        f"FROM: {tx['FROM']}",
+        f"TO: {tx['TO']}",
+        f"AMOUNT: {tx['AMOUNT']}",
+        f"INPUT_TXIDS: {tx['INPUT_TXIDS']}",
+        f"OUTPUT_TO_TXID: {tx['OUTPUT_TO_TXID']}",
+    ]
+    if output_change_txid:
+        pr_body_lines.append(f"OUTPUT_CHANGE_TXID: {tx['OUTPUT_CHANGE_TXID']}")
+    if memo:
+        pr_body_lines.append(f"MEMO: {tx['MEMO']}")
+    pr_body_lines.append(f"SIGNATURE: {signature_b64}")
+    print('\n'.join(pr_body_lines))
+
+    print()
+    print("=" * 60)
+    print("STEP 2 — Make these file changes in your fork before creating the PR:")
+    print("=" * 60)
+    print()
+    for txid in input_txids:
+        print(f"  DELETE:  utxo/{txid}.json")
+    print()
+    to_utxo_path = f"utxo/{output_to_txid}.json"
+    print(f"  CREATE:  {to_utxo_path}")
+    print(f"  Content: {json.dumps(output_to_utxo, indent=4)}")
+    print()
+    if output_change_utxo:
+        change_utxo_path = f"utxo/{output_change_txid}.json"
+        print(f"  CREATE:  {change_utxo_path}")
+        print(f"  Content: {json.dumps(output_change_utxo, indent=4)}")
+        print()
+
+    print("=" * 60)
+    print("STEP 3 — Create a PR from your fork to main with the above file")
+    print("  changes and PR body. The title should be:")
+    print(f"  tx: {from_user} → {to_user} {amount} GTC")
+    print("=" * 60)
+
+    # Optionally write the UTXO files automatically
+    write = input("\nAuto-write the output UTXO files to your local utxo/ directory? [y/N]: ").strip().lower()
+    if write == 'y':
+        Path(to_utxo_path).write_text(json.dumps(output_to_utxo, indent=2))
+        print(f"  Written: {to_utxo_path}")
+        if output_change_utxo:
+            Path(change_utxo_path).write_text(json.dumps(output_change_utxo, indent=2))
+            print(f"  Written: {change_utxo_path}")
+        print()
+        print("Now run:")
+        for txid in input_txids:
+            print(f"  git rm utxo/{txid}.json")
+        print(f"  git add utxo/")
+        print(f'  git commit -m "tx: {from_user} → {to_user} {amount} GTC"')
+        print(f"  git push")
+        print("Then open a PR from your fork to the main repo's main branch.")
+
+
+if __name__ == '__main__':
+    main()

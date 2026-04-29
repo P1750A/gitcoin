@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GitCoin — Balance Explorer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+      padding: 2rem 1rem;
+    }
+    header {
+      max-width: 800px;
+      margin: 0 auto 2rem;
+    }
+    h1 {
+      font-size: 2rem;
+      font-weight: 600;
+      color: #58a6ff;
+      margin-bottom: 0.5rem;
+    }
+    .subtitle { color: #8b949e; font-size: 0.9rem; }
+    .block-info {
+      max-width: 800px;
+      margin: 0 auto 1.5rem;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+    }
+    .block-info .item { font-size: 0.85rem; }
+    .block-info .label { color: #8b949e; margin-bottom: 0.25rem; }
+    .block-info .value { font-family: "SFMono-Regular", Consolas, monospace; color: #e6edf3; }
+    .block-info .value.hash { color: #58a6ff; word-break: break-all; }
+    table {
+      max-width: 800px;
+      margin: 0 auto;
+      width: 100%;
+      border-collapse: collapse;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    thead { background: #21262d; }
+    th {
+      padding: 0.75rem 1.25rem;
+      text-align: left;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #8b949e;
+    }
+    th:last-child { text-align: right; }
+    td {
+      padding: 0.75rem 1.25rem;
+      border-top: 1px solid #21262d;
+      font-size: 0.9rem;
+    }
+    td:last-child { text-align: right; font-family: "SFMono-Regular", Consolas, monospace; }
+    td.rank { color: #8b949e; width: 48px; }
+    td.username { font-weight: 500; }
+    td.amount { color: #3fb950; font-weight: 600; }
+    tr:hover td { background: #1c2128; }
+    .empty {
+      max-width: 800px;
+      margin: 2rem auto;
+      text-align: center;
+      color: #8b949e;
+      padding: 3rem;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+    }
+    .error { color: #f85149; }
+    footer {
+      max-width: 800px;
+      margin: 2rem auto 0;
+      text-align: center;
+      color: #8b949e;
+      font-size: 0.8rem;
+    }
+    footer a { color: #58a6ff; text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+    .loading { color: #8b949e; text-align: center; padding: 2rem; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>⛓ GitCoin</h1>
+    <p class="subtitle">A decentralized token ledger running entirely on GitHub</p>
+  </header>
+
+  <div class="block-info" id="block-info">
+    <p class="loading">Loading ledger...</p>
+  </div>
+
+  <div id="table-container">
+    <p class="loading">Loading balances...</p>
+  </div>
+
+  <footer>
+    <p>
+      Ledger is derived from <code>utxo/</code> files on the
+      <a href="../../tree/main/utxo" target="_blank">main branch</a>.
+      Verify it yourself: <code>git clone</code> the repo and inspect the history.
+    </p>
+  </footer>
+
+  <script>
+    async function loadLedger() {
+      const blockInfoEl = document.getElementById('block-info');
+      const tableEl = document.getElementById('table-container');
+
+      let ledger;
+      try {
+        const res = await fetch('./ledger.json');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        ledger = await res.json();
+      } catch (e) {
+        blockInfoEl.innerHTML = `<p class="error">Failed to load ledger: ${e.message}</p>`;
+        tableEl.innerHTML = '';
+        return;
+      }
+
+      const shortHash = ledger.block_hash
+        ? ledger.block_hash.substring(0, 16) + '...'
+        : 'unknown';
+
+      blockInfoEl.innerHTML = `
+        <div class="item">
+          <div class="label">Block Height</div>
+          <div class="value">#${ledger.block_height ?? 0}</div>
+        </div>
+        <div class="item">
+          <div class="label">Block Hash</div>
+          <div class="value hash">${ledger.block_hash ?? 'N/A'}</div>
+        </div>
+        <div class="item">
+          <div class="label">Last Updated</div>
+          <div class="value">${ledger.updated_at ?? 'N/A'}</div>
+        </div>
+        <div class="item">
+          <div class="label">Active UTXOs</div>
+          <div class="value">${ledger.utxo_count ?? 0}</div>
+        </div>
+        <div class="item">
+          <div class="label">Total Supply</div>
+          <div class="value">${Object.values(ledger.balances ?? {}).reduce((a, b) => a + b, 0).toLocaleString()} GTC</div>
+        </div>
+      `;
+
+      const balances = Object.entries(ledger.balances ?? {});
+      if (balances.length === 0) {
+        tableEl.innerHTML = '<div class="empty">No balances found. Genesis block not yet committed.</div>';
+        return;
+      }
+
+      const rows = balances
+        .map(([user, bal], i) => `
+          <tr>
+            <td class="rank">${i + 1}</td>
+            <td class="username">
+              <a href="https://github.com/${user}" target="_blank" style="color:#58a6ff;text-decoration:none">
+                @${user}
+              </a>
+            </td>
+            <td class="amount">${bal.toLocaleString()} GTC</td>
+          </tr>
+        `)
+        .join('');
+
+      tableEl.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Account</th>
+              <th style="text-align:right">Balance (GTC)</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    loadLedger();
+  </script>
+
+</body>
+</html>

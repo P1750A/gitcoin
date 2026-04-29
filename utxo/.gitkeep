@@ -1,0 +1,2 @@
+# This file keeps the utxo/ directory tracked by git.
+# It will be replaced by real UTXO files after the genesis commit.
