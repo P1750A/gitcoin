@@ -24,6 +24,7 @@ The script reads input UTXO files from the local utxo/ directory
 import base64
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -217,22 +218,28 @@ def main():
     print(f"  tx: {from_user} → {to_user} {amount} GTC")
     print("=" * 60)
 
-    # Optionally write the UTXO files automatically
-    write = input("\nAuto-write the output UTXO files to your local utxo/ directory? [y/N]: ").strip().lower()
-    if write == 'y':
-        Path(to_utxo_path).write_text(json.dumps(output_to_utxo, indent=2))
-        print(f"  Written: {to_utxo_path}")
-        if output_change_utxo:
-            Path(change_utxo_path).write_text(json.dumps(output_change_utxo, indent=2))
-            print(f"  Written: {change_utxo_path}")
-        print()
-        print("Now run:")
-        for txid in input_txids:
-            print(f"  git rm utxo/{txid}.json")
-        print(f"  git add utxo/")
-        print(f'  git commit -m "tx: {from_user} → {to_user} {amount} GTC"')
-        print(f"  git push")
-        print("Then open a PR from your fork to the main repo's main branch.")
+    # Auto-write output UTXO files
+    Path(to_utxo_path).write_text(json.dumps(output_to_utxo, indent=2))
+    print(f"\n  Written: {to_utxo_path}")
+    if output_change_utxo:
+        Path(change_utxo_path).write_text(json.dumps(output_change_utxo, indent=2))
+        print(f"  Written: {change_utxo_path}")
+
+    # git rm input UTXOs
+    print()
+    for txid in input_txids:
+        r = subprocess.run(['git', 'rm', f'utxo/{txid}.json'], capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"  git rm: utxo/{txid}.json")
+        else:
+            print(f"  WARNING: git rm failed for utxo/{txid}.json: {r.stderr.strip()}")
+
+    print()
+    print("Now run:")
+    print(f"  git add utxo/")
+    print(f'  git commit -m "tx: {from_user} → {to_user} {amount} GTC"')
+    print(f"  git push")
+    print("Then open a PR to the main repo's main branch.")
 
 
 if __name__ == '__main__':

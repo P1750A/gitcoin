@@ -17,10 +17,37 @@ jobs:
         with:
           ref: main
 
+      - name: Check if this is a transaction PR
+        id: is_tx
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if echo "$PR_BODY" | grep -q "TX_VERSION"; then
+            echo "is_tx=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_tx=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post success status for non-TX PRs
+        if: steps.is_tx.outputs.is_tx == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state=success \
+            -f context="validate-tx/validate" \
+            -f description="Not a transaction PR, skipping validation"
+          gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state=success \
+            -f context="consensus-check/passed" \
+            -f description="Not a transaction PR, consensus not required"
+
       - name: Install Python dependencies
+        if: steps.is_tx.outputs.is_tx == 'true'
         run: pip install cryptography --quiet
 
       - name: Fetch PR changed files
+        if: steps.is_tx.outputs.is_tx == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -28,6 +55,7 @@ jobs:
             > /tmp/pr_files.json
 
       - name: Fetch PR head file contents
+        if: steps.is_tx.outputs.is_tx == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -63,6 +91,7 @@ jobs:
           EOF
 
       - name: Run transaction validation
+        if: steps.is_tx.outputs.is_tx == 'true'
         id: validate
         continue-on-error: true
         env:
@@ -75,17 +104,83 @@ jobs:
             2>&1 | tee /tmp/result.txt
           exit ${PIPESTATUS[0]}
 
-      - name: Post success status
+      - name: Post success status and assign validators
         if: steps.validate.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+          gh api "repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
             -f state=success \
             -f context="validate-tx/validate" \
             -f description="Transaction is valid"
-          gh pr edit ${{ github.event.pull_request.number }} --add-label "tx-valid" 2>/dev/null || true
-          gh pr edit ${{ github.event.pull_request.number }} --remove-label "tx-invalid" 2>/dev/null || true
+          gh pr edit "${PR_NUMBER}" --add-label "tx-valid" 2>/dev/null || true
+          gh pr edit "${PR_NUMBER}" --remove-label "tx-invalid" 2>/dev/null || true
+
+          python3 - << 'EOF'
+          import json, random, math, subprocess, os, sys
+          from datetime import datetime, timezone, timedelta
+
+          registry_path = 'validators/registry.json'
+          with open(registry_path) as f:
+              registry = json.load(f)
+
+          now = datetime.now(timezone.utc)
+          active = []
+          for v in registry.get('validators', []):
+              if v.get('status') != 'active':
+                  continue
+              score = v.get('score', 0)
+              last_active_str = v.get('last_active', '')
+              if last_active_str:
+                  try:
+                      last_active = datetime.fromisoformat(last_active_str.replace('Z', '+00:00'))
+                      weeks_inactive = max(0, (now - last_active).days // 7)
+                      score -= weeks_inactive * 10
+                  except ValueError:
+                      pass
+              if score >= 0:
+                  active.append(v)
+
+          if not active:
+              print("ERROR: No active validators found", file=sys.stderr)
+              sys.exit(1)
+
+          rng = random.Random(int(os.environ['RUN_ID']))
+          selected_count = min(7, len(active))
+          selected = rng.sample(active, selected_count)
+          required = math.ceil(selected_count * 2 / 3)
+          usernames = [v['username'] for v in selected]
+          mentions = ' '.join(f"@{u}" for u in usernames)
+          deadline = (now + timedelta(hours=48)).strftime('%Y-%m-%d %H:%M UTC')
+
+          comment = (
+              f"## Validator Vote Requested\n\n"
+              f"{mentions}\n\n"
+              f"You have been selected to validate this transaction. "
+              f"To cast your vote, post the following comment on this PR:\n\n"
+              f"```\n/approve\n```\n\n"
+              f"**Consensus required**: {required} of {selected_count} selected validators\n"
+              f"**Deadline**: {deadline}\n\n"
+              f"If {required} approvals are not received by the deadline, "
+              f"this transaction will be automatically expired.\n\n"
+              f"---\n"
+              f"<!-- GITCOIN_VALIDATORS:{','.join(usernames)} -->\n"
+              f"<!-- GITCOIN_REQUIRED:{required} -->"
+          )
+
+          r = subprocess.run(
+              ['gh', 'pr', 'comment', os.environ['PR_NUMBER'], '--body', comment],
+              capture_output=True, text=True, env=os.environ
+          )
+          if r.returncode != 0:
+              print(f"ERROR: Failed to post comment: {r.stderr}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Assigned {selected_count} validators, {required} approvals required: {', '.join(usernames)}")
+          EOF
 
       - name: Post failure status
         if: steps.validate.outcome == 'failure'
